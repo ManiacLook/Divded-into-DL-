@@ -63,10 +63,6 @@ def load_data_fashion_mnist(batch_size, resize=None, root='~/Datasets/FashionMNI
     
     return train_iter, test_iter
 
-batch_size = 128
-# 如出现“out of memory”的报错信息，可减小batch_size或resize
-train_iter, test_iter = load_data_fashion_mnist(batch_size, resize=224)
-
 def show_fashion_mnist(images, labels):
     use_svg_display()
     # 这里的_表示我们忽略（不使用）的变量
@@ -199,3 +195,22 @@ class GlobalAvgPool2d(nn.Module):
         super(GlobalAvgPool2d, self).__init__()
     def forward(self, x):
         return F.avg_pool2d(x, kernel_size=x.size()[2:])
+    
+class Residual(nn.Module):
+    def __init__(self, in_channels, out_channels, use_1x1conv=False, stride=1):
+        super(Residual, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        if use_1x1conv:
+            self.conv3 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride)
+        else:
+            self.conv3 = None
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+    
+    def forward(self, X):
+        Y = F.relu(self.bn1(self.conv1(X)))
+        Y = self.bn2(self.conv2(Y))
+        if self.conv3:
+            X = self.conv3(X)
+        return F.relu(Y + X)
