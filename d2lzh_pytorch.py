@@ -165,9 +165,11 @@ def semilogy(x_vals, y_vals, x_label, y_label, x2_vals=None, y2_vals=None, legen
         plt.semilogy(x2_vals, y2_vals, linestyle=":")
         plt.legend(legend)
         
-def evaluate_accuracy(data_iter, net):
+def evaluate_accuracy(data_iter, net, device):
     acc_sum, n = 0.0, 0
     for X, y in data_iter:
+        X = X.to(device)
+        y = y.to(device)
         if isinstance(net, torch.nn.Module):  # 调用pytorch模型
             net.eval()  # 评估模式, 这会关闭dropout
             acc_sum += (net(X).argmax(dim=1) == y).float().sum().item()
