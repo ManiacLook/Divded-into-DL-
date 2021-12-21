@@ -11,6 +11,55 @@ import sys
 import time
 import torch.nn.functional as F
 import math
+import os
+import json
+from PIL import Image
+import requests
+import tarfile
+import zipfile
+import hashlib
+import pandas as pd
+
+# 用于设置由matplotlib生成图表的轴的属性。
+def set_axes(axes, xlabel, ylabel, xlim, ylim, xscale, yscale, legend):
+    """设置matplotlib的轴"""
+    axes.set_xlabel(xlabel)
+    axes.set_ylabel(ylabel)
+    axes.set_xscale(xscale)
+    axes.set_yscale(yscale)
+    axes.set_xlim(xlim)
+    axes.set_ylim(ylim)
+    if legend:
+        axes.legend(legend)
+    axes.grid()
+
+class Timer:  #@save
+    """记录多次运行时间"""
+    def __init__(self):
+        self.times = []
+        self.start()
+
+    def start(self):
+        """启动计时器"""
+        self.tik = time.time()
+
+    def stop(self):
+        """停止计时器并将时间记录在列表中"""
+        self.times.append(time.time() - self.tik)
+        return self.times[-1]
+
+    def avg(self):
+        """返回平均时间"""
+        return sum(self.times) / len(self.times)
+
+    def sum(self):
+        """返回时间总和"""
+        return sum(self.times)
+
+    def cumsum(self):
+        """返回累计时间"""
+        return np.array(self.times).cumsum().tolist()
+
 
 def use_svg_display():
     display.set_matplotlib_formats('svg')
@@ -101,6 +150,60 @@ def evaluate_accuracy_device(data_iter, net, device=None):
                     acc_sum += (net(X).argmax(dim=1) == y).float().sum().item()
             n += y.shape[0]
     return acc_sum / n
+
+class Animator:  #@save
+    """在动画中绘制数据"""
+    def __init__(self, xlabel=None, ylabel=None, legend=None, xlim=None,
+                 ylim=None, xscale='linear', yscale='linear',
+                 fmts=('-', 'm--', 'g-.', 'r:'), nrows=1, ncols=1,
+                 figsize=(3.5, 2.5)):
+        # 增量地绘制多条线
+        if legend is None:
+            legend = []
+        use_svg_display()
+        self.fig, self.axes = plt.subplots(nrows, ncols, figsize=figsize)
+        if nrows * ncols == 1:
+            self.axes = [self.axes, ]
+        # 使用lambda函数捕获参数
+        self.config_axes = lambda: set_axes(self.axes[0], xlabel, ylabel, xlim, ylim, xscale, yscale, legend)
+        self.X, self.Y, self.fmts = None, None, fmts
+
+    def add(self, x, y):
+        # 向图表中添加多个数据点
+        if not hasattr(y, "__len__"):
+            y = [y]
+        n = len(y)
+        if not hasattr(x, "__len__"):
+            x = [x] * n
+        if not self.X:
+            self.X = [[] for _ in range(n)]
+        if not self.Y:
+            self.Y = [[] for _ in range(n)]
+        for i, (a, b) in enumerate(zip(x, y)):
+            if a is not None and b is not None:
+                self.X[i].append(a)
+                self.Y[i].append(b)
+        self.axes[0].cla()
+        for x, y, fmt in zip(self.X, self.Y, self.fmts):
+            self.axes[0].plot(x, y, fmt)
+        self.config_axes()
+        display.display(self.fig)
+        display.clear_output(wait=True)
+        
+class Accumulator:  #@save
+    """在n个变量上累加"""
+    def __init__(self, n):
+        self.data = [0.0] * n
+
+    def add(self, *args):
+        self.data = [a + float(b) for a, b in zip(self.data, args)]
+
+    def reset(self):
+        self.data = [0.0] * len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+    
 
 def train_ch3(net, train_iter, test_iter, loss, num_epochs, batch_size, params=None, lr=None, optimizer=None):
     for epoch in range(num_epochs):
@@ -285,302 +388,309 @@ def bbox_to_rect(bbox, color):
         xy=(bbox[0], bbox[1]), width=bbox[2] - bbox[0], height=bbox[3] - bbox[1],
         fill=False, edgecolor=color, linewidth=2)
 
-############################################ 9.4 ###########################################
-def MultiBoxPrior(feature_map, sizes=[0.75, 0.5, 0.25], ratios=[1, 2, 0.5]):
+def box_corner_to_center(boxes):
+    """从（左上，右下）转换到（中间，宽度，高度）"""
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    w = x2 - x1
+    h = y2 - y1
+    boxes = torch.stack((cx, cy, w, h), axis=-1)
+    return boxes
+
+def box_center_to_corner(boxes):
+    """从（中间，宽度，高度）转换到（左上，右下）"""
+    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = cx - 0.5 * w
+    y1 = cy - 0.5 * h
+    x2 = cx + 0.5 * w
+    y2 = cy + 0.5 * h
+    boxes = torch.stack((x1, y1, x2, y2), axis=-1)
+    return boxes
+
+############################################ 13.4 ###########################################
+def multibox_prior(data, sizes, ratios):
     """
-    # 按照「9.4.1. 生成多个锚框」所讲的实现, anchor表示成(xmin, ymin, xmax, ymax).
-    https://zh.d2l.ai/chapter_computer-vision/anchor.html
+    生成以每个像素为中心具有不同形状的锚框
     Args:
-        feature_map: torch tensor, Shape: [N, C, H, W].
+        data: torch tensor, Shape: [N, C, H, W].
         sizes: List of sizes (0~1) of generated MultiBoxPriores. 
         ratios: List of aspect ratios (non-negative) of generated MultiBoxPriores. 
     Returns:
         anchors of shape (1, num_anchors, 4). 由于batch里每个都一样, 所以第一维为1
     """
-    pairs = []  # pair of (size, sqrt(ratio))
-    for r in ratios:
-        pairs.append([sizes[0], math.sqrt(r)])
-    for s in sizes[1:]:
-        pairs.append([s, math.sqrt(ratios[0])])
+    in_height, in_width = data.shape[-2:]
+    device, num_sizes, num_ratios = data.device, len(sizes), len(ratios)
+    boxes_per_pixel = (num_sizes + num_ratios - 1)
+    size_tensor = torch.tensor(sizes, device=device)
+    ratio_tensor = torch.tensor(ratios, device=device)
     
-    pairs = np.array(pairs)
+    # 为了将锚点移动到像素的中心，需要设置偏移量。
+    # 因为一个像素的的高为1且宽为1，我们选择偏移我们的中心0.5
+    offset_h, offset_w = 0.5, 0.5
+    steps_h = 1.0 / in_height  # 在y轴上缩放步长
+    steps_w = 1.0 / in_width  # 在x轴上缩放步长
     
-    ss1 = pairs[:, 0] * pairs[:, 1]  # size * sqrt(ratio)
-    ss2 = pairs[:, 0] / pairs[:, 1]  # size / sqrt(ratio)
+    # 生成锚框的所有中心点
+    center_h = (torch.arange(in_height, device=device) + offset_h) * steps_h
+    center_w = (torch.arange(in_width, device=device) + offset_w) * steps_w
+    shift_y, shift_x = torch.meshgrid(center_h, center_w)
+    shift_y, shift_x = shift_y.reshape(-1), shift_x.reshape(-1)
     
-    base_anchors = np.stack([-ss1, -ss2, ss1, ss2], axis=1) / 2
+    # 生成“boxes_per_pixel”个高和宽
+    # 之后用于创建锚框的四角坐标(xmin,xmax,ymin,ymax)
+    # 处理矩形输入
+    w = torch.cat((size_tensor * torch.sqrt(ratio_tensor[0]), sizes[0] * torch.sqrt(ratio_tensor[1:]))) * in_height / in_width 
+    h = torch.cat((size_tensor / torch.sqrt(ratio_tensor[0]), sizes[0] * torch.sqrt(ratio_tensor[1:])))
+    # 除以2来获得半高和半宽
+    anchor_manipulations = torch.stack((-w, -h, w, h)).T.repeat(in_height * in_width, 1) / 2
     
-    h, w = feature_map.shape[-2:]
-    shifts_x = np.arange(0, w) / w
-    shifts_y = np.arange(0, h) / h
-    shift_x, shift_y = np.meshgrid(shifts_x, shifts_y)
-    shift_x = shift_x.reshape(-1)
-    shift_y = shift_y.reshape(-1)
-    shifts = np.stack((shift_x, shift_y, shift_x, shift_y), axis=1)
-    
-    anchors = shifts.reshape((-1, 1, 4)) + base_anchors.reshape((1, -1, 4))
-    
-    return torch.tensor(anchors, dtype=torch.float32).view(1, -1, 4)
+    # 每个中心点都将有“boxes_per_pixel”个锚框，
+    # 所以生成含所有锚框中心的网格，重复了“boxes_per_pixel”次
+    out_grid = torch.stack([shift_x, shift_y, shift_x, shift_y], dim=1).repeat_interleave(boxes_per_pixel, dim=0)
+    output = out_grid + anchor_manipulations
+    return output.unsqueeze(0)
 
 def show_bboxes(axes, bboxes, labels=None, colors=None):
+    """显示所有边界框"""
     def _make_list(obj, default_values=None):
         if obj is None:
             obj = default_values
         elif not isinstance(obj, (list, tuple)):
             obj = [obj]
         return obj
-    
+
     labels = _make_list(labels)
     colors = _make_list(colors, ['b', 'g', 'r', 'm', 'c'])
     for i, bbox in enumerate(bboxes):
         color = colors[i % len(colors)]
-        rect = bbox_to_rect(bbox.detach().cpu().numpy(), color)
+        rect = bbox_to_rect(bbox.detach().numpy(), color)
         axes.add_patch(rect)
         if labels and len(labels) > i:
             text_color = 'k' if color == 'w' else 'w'
             axes.text(rect.xy[0], rect.xy[1], labels[i],
-                      va='center', ha='center', fontsize=6, color=text_color,
+                      va='center', ha='center', fontsize=9, color=text_color,
                       bbox=dict(facecolor=color, lw=0))
-      
-def compute_intersection(set_1, set_2):
-    """
-    计算anchor之间的交集
-    Args:
-        set_1: a tensor of dimensions (n1, 4), anchor表示成(xmin, ymin, xmax, ymax)
-        set_2: a tensor of dimensions (n2, 4), anchor表示成(xmin, ymin, xmax, ymax)
-    Returns:
-        intersection of each of the boxes in set 1 with respect to each of the boxes in set 2, shape: (n1, n2)
-    """
-    # 找到两个anchor交集的左上角坐标和右下角坐标
-    lower_bounds = torch.max(set_1[:, :2].unsqueeze(1), set_2[:, :2].unsqueeze(0))  # (n1, n2, 2)
-    upper_bounds = torch.min(set_1[:, 2:].unsqueeze(1), set_2[:, 2:].unsqueeze(0))  # (n1, n2, 2)
-    # 宽高
-    intersection_dims = torch.clamp(upper_bounds - lower_bounds, min=0)  # (n1, n2, 2)
-    return intersection_dims[:, :, 0] * intersection_dims[:, :, 1]  # (n1, n2)
+            
+def box_iou(boxes1, boxes2):
+    """计算两个锚框或边界框列表中成对的交并比"""
+    box_area = lambda boxes: ((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]))
+    # boxes1,boxes2,areas1,areas2的形状:
+    # boxes1：(boxes1的数量,4),
+    # boxes2：(boxes2的数量,4),
+    # areas1：(boxes1的数量,),
+    # areas2：(boxes2的数量,)
+    areas1 = box_area(boxes1)
+    areas2 = box_area(boxes2)
+    # inter_upperlefts,inter_lowerrights,inters的形状:
+    # (boxes1的数量,boxes2的数量,2)
+    inter_upperlefts = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    inter_lowerrights = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    inters = (inter_lowerrights - inter_upperlefts).clamp(min=0)
+    # inter_areasandunion_areas的形状:(boxes1的数量,boxes2的数量)
+    inter_areas = inters[:, :, 0] * inters[:, :, 1]
+    union_areas = areas1[:, None] + areas2 - inter_areas
+    return inter_areas / union_areas
 
-def compute_jaccard(set_1, set_2):
-    """
-    计算anchor之间的Jaccard系数(IoU)
-    Args:
-        set_1: a tensor of dimensions (n1, 4), anchor表示成(xmin, ymin, xmax, ymax)
-        set_2: a tensor of dimensions (n2, 4), anchor表示成(xmin, ymin, xmax, ymax)
-    Returns:
-        Jaccard Overlap of each of the boxes in set 1 with respect to each of the boxes in set 2, shape: (n1, n2)
-    """
-    # Find intersections
-    intersection = compute_intersection(set_1, set_2)  # (n1, n2)
-    
-    # Find areas of each box in both sets
-    areas_set_1 = (set_1[:, 2] - set_1[:, 0]) * (set_1[:, 3] - set_1[:, 1])  # (n1)
-    areas_set_2 = (set_2[:, 2] - set_2[:, 0]) * (set_2[:, 3] - set_2[:, 1])  # (n2)
-    
-    # Find the union
-    union = areas_set_1.unsqueeze(1) + areas_set_2.unsqueeze(0) - intersection  # (n1, n2)
-    
-    return intersection / union  # (n1, n2)
+def assign_anchor_to_bbox(ground_truth, anchors, device, iou_threshold=0.5):
+    """将最接近的真实边界框分配给锚框"""
+    num_anchors, num_gt_boxes = anchors.shape[0], ground_truth.shape[0]
+    # 位于第i行和第j列的元素x_ij是锚框i和真实边界框j的IoU
+    jaccard = box_iou(anchors, ground_truth)
+    # 对于每个锚框，分配的真实边界框的张量
+    anchors_bbox_map = torch.full((num_anchors, ), -1, dtype=torch.long, device=device)
+    # 根据阈值，决定是否分配真实边界框
+    max_ious, indices = torch.max(jaccard, dim=1)
+    anc_i = torch.nonzero(max_ious >= 0.5).reshape(-1)
+    box_j = indices[max_ious >= 0.5]
+    anchors_bbox_map[anc_i] = box_j
+    col_discard = torch.full((num_anchors,), -1)
+    row_discard = torch.full((num_gt_boxes,), -1)
+    for _ in range(num_gt_boxes):
+        max_idx = torch.argmax(jaccard)
+        box_idx = (max_idx % num_gt_boxes).long()  # 列数
+        anc_idx = (max_idx / num_gt_boxes).long()  # 行数
+        anchors_bbox_map[anc_idx] = box_idx  # 记录对应行的对应列（最大IOU）
+        jaccard[:, box_idx] = col_discard  # -1表示丢弃
+        jaccard[anc_idx, :] = row_discard
+    return anchors_bbox_map
 
-def assign_anchor(bb, anchor, jaccard_threshold=0.5):
-    """
-    # 按照「9.4.1. 生成多个锚框」图9.3所讲为每个anchor分配真实的bb, anchor表示成归一化(xmin, ymin, xmax, ymax).
-    https://zh.d2l.ai/chapter_computer-vision/anchor.html
-    Args:
-        bb: 真实边界框(bounding box), shape:（nb, 4）
-        anchor: 待分配的anchor, shape:（na, 4）
-        jaccard_threshold: 预先设定的阈值
-    Returns:
-        assigned_idx: shape: (na, ), 每个anchor分配的真实bb对应的索引, 若未分配任何bb则为-1
-    """
-    na = anchor.shape[0]
-    nb = bb.shape[0]
-    jaccard = compute_jaccard(anchor, bb).detach().cpu().numpy()  # shape: (na, nb)
-    assigned_idx = np.ones(na) * -1  # 初始化为-1
-    
-    # 先为每个bb分配一个anchor(不要求满足jaccard_threshold)
-    jaccard_cp = jaccard.copy()
-    for j in range(nb):  # 按列循环，相当于每次循环去掉一列
-        i = np.argmax(jaccard_cp[:, j])  # 获得每个真实框中iou最大的anchor
-        assigned_idx[i] = j
-        jaccard_cp[i, :] = float("-inf")  # 赋值为负无穷, 相当于去掉这一行
-    
-    # 处理还未被分配的anchor, 要求满足jaccard_threshold
-    for i in range(na):
-        if assigned_idx[i] == -1:
-            j = np.argmax(jaccard[i, :])
-            if jaccard[i, j] >= jaccard_threshold:
-                assigned_idx[i] = j
-    
-    return torch.tensor(assigned_idx, dtype=torch.long)
+def offset_boxes(anchors, assigned_bb, eps=1e-6):
+    """对锚框偏移量的转换"""
+    c_anc = box_corner_to_center(anchors)
+    c_assigned_bb = box_corner_to_center(assigned_bb)
+    offset_xy = 10 * (c_assigned_bb[:, :2] - c_anc[:, :2]) / c_anc[:, 2:]
+    offset_wh = 5 * torch.log(eps + c_assigned_bb[:, 2:] / c_anc[:, 2:])
+    offset = torch.cat([offset_xy, offset_wh], axis=1)
+    return offset
 
-def xy_to_cxcy(xy):
-    """
-    将(x_min, y_min, x_max, y_max)形式的anchor转换成(center_x, center_y, w, h)形式的.
-    https://github.com/sgrvinod/a-PyTorch-Tutorial-to-Object-Detection/blob/master/utils.py
-    Args:
-        xy: bounding boxes in boundary coordinates, a tensor of size (n_boxes, 4)
-    Returns: 
-        bounding boxes in center-size coordinates, a tensor of size (n_boxes, 4)
-    """
-    return torch.cat([(xy[:, 2:] + xy[:, :2]) / 2,   # c_x, c_y
-                      (xy[:, 2:] - xy[:, :2]) / 2], 1)  # w, h
-
-def MultiBoxTarget(anchor, label):
-    """
-    # 按照「9.4.1. 生成多个锚框」所讲的实现, anchor表示成归一化(xmin, ymin, xmax, ymax).
-    https://zh.d2l.ai/chapter_computer-vision/anchor.html
-    Args:
-        anchor: torch tensor, 输入的锚框, 一般是通过MultiBoxPrior生成, shape:（1，锚框总数，4）
-        label: 真实标签, shape为(bn, 每张图片最多的真实锚框数, 5)
-               第二维中，如果给定图片没有这么多锚框, 可以先用-1填充空白, 最后一维中的元素为[类别标签, 四个坐标值]
-    Returns:
-        列表, [bbox_offset, bbox_mask, cls_labels]
-        bbox_offset: 每个锚框的标注偏移量，形状为(bn，锚框总数*4)
-        bbox_mask: 形状同bbox_offset, 每个锚框的掩码, 一一对应上面的偏移量, 负类锚框(背景)对应的掩码均为0, 正类锚框的掩码均为1
-        cls_labels: 每个锚框的标注类别, 其中0表示为背景, 形状为(bn，锚框总数)
-    """
-    assert len(anchor.shape) == 3 and len(label.shape) == 3
-    bn = label.shape[0]
-    
-    def MultiBoxTarget_one(anc, lab, eps=1e-6):
-        """
-        MultiBoxTarget函数的辅助函数, 处理batch中的一个
-        Args:
-            anc: shape of (锚框总数, 4)
-            lab: shape of (真实锚框数, 5), 5代表[类别标签, 四个坐标值]
-            eps: 一个极小值, 防止log0
-        Returns:
-            offset: (锚框总数*4, )
-            bbox_mask: (锚框总数*4, ), 0代表背景, 1代表非背景
-            cls_labels: (锚框总数, ), 0代表背景
-        """
-        an = anc.shape[0]
-        assigned_idx = assign_anchor(lab[:, 1:], anc)  # (锚框总数, )
-        bbox_mask = ((assigned_idx >= 0).float().unsqueeze(-1)).repeat(1, 4)  # (锚框总数， 4)
-        
-        cls_labels = torch.zeros(an, dtype=torch.long)  # 0表示背景
-        assigned_bb = torch.zeros((an, 4), dtype=torch.float32)  # 所有anchor对应的bb坐标
-        for i in range(an):
-            bb_idx = assigned_idx[i]
-            if bb_idx >= 0:  # 非背景
-                cls_labels[i] = lab[bb_idx, 0].long().item() + 1
-                assigned_bb[i, :] = lab[bb_idx, 1:]
-        
-        center_anc = xy_to_cxcy(anc)  # (center_x, center_y, w, h)
-        center_assigned_bb = xy_to_cxcy(assigned_bb)
-        
-        offset_xy = 10.0 * (center_assigned_bb[:, :2] - center_anc[:, :2]) / center_anc[:, 2:]
-        offset_wh = 5.0 * torch.log(eps + center_assigned_bb[:, 2:] / center_anc[:, 2:])
-        offset = torch.cat([offset_xy, offset_wh], dim=1) * bbox_mask  # (锚框总数, 4)
-        
-        return offset.view(-1), bbox_mask.view(-1), cls_labels
-    
-    batch_offset = []
-    batch_mask = []
-    batch_cls_labels = []
-    for b in range(bn):
-        offset, bbox_mask, cls_labels = MultiBoxTarget_one(anchor[0, :, :], label[b, :, :])
-        
-        batch_offset.append(offset)
-        batch_mask.append(bbox_mask)
-        batch_cls_labels.append(cls_labels)
-    
+def multibox_target(anchors, labels):
+    """使用真实边界框标记锚框"""
+    batch_size, anchors = labels.shape[0], anchors.squeeze(0)
+    batch_offset, batch_mask, batch_class_labels = [], [], []
+    device, num_anchors = anchors.device, anchors.shape[0]
+    for i in range(batch_size):
+        label = labels[i, :, :]
+        anchors_bbox_map = assign_anchor_to_bbox(label[:, 1:], anchors, device)  # label[:, 1]是类别
+        bbox_mask = ((anchors_bbox_map >= 0).float().unsqueeze(-1)).repeat(1, 4)
+        # 将类标签和分配的边界框坐标初始化为零
+        class_labels = torch.zeros(num_anchors, dtype=torch.long, device=device)
+        assigned_bb = torch.zeros((num_anchors, 4), dtype=torch.float32, device=device)
+        # 使用真实边界框来标记锚框的类别。
+        # 如果一个锚框没有被分配，我们标记其为背景（值为零）
+        indices_true = torch.nonzero(anchors_bbox_map >= 0)
+        bb_idx = anchors_bbox_map[indices_true]
+        class_labels[indices_true] = label[bb_idx, 0].long() + 1  # 目标类别为 1
+        assigned_bb[indices_true] = label[bb_idx, 1:]
+        # 偏移量转换
+        offset = offset_boxes(anchors, assigned_bb) * bbox_mask
+        batch_offset.append(offset.reshape(-1))
+        batch_mask.append(bbox_mask.reshape(-1))
+        batch_class_labels.append(class_labels)
     bbox_offset = torch.stack(batch_offset)
     bbox_mask = torch.stack(batch_mask)
-    cls_labels = torch.stack(batch_cls_labels)
-    
-    return [bbox_offset, bbox_mask, cls_labels]
+    class_labels = torch.stack(batch_class_labels)
+    return (bbox_offset, bbox_mask, class_labels)
 
-def non_max_suppression(bb_info_list, nms_threshold=0.5):
-    """
-    非极大抑制处理预测的边界框
-    Args:
-        bb_info_list: Pred_BB_Info的列表, 包含预测类别、置信度等信息
-        nms_threshold: 阈值
-    Returns:
-        output: Pred_BB_Info的列表, 只保留过滤后的边界框信息
-    """
-    output = []
-    # 先根据置信度从高到低排序
-    sorted_bb_info_list = sorted(bb_info_list, key = lambda x: x.confidence, reverse=True)
-    
-    while len(sorted_bb_info_list) != 0:
-        best = sorted_bb_info_list.pop(0)
-        output.append(best)
-        
-        if len(sorted_bb_info_list) == 0:
-            break
-        
-        bb_xyxy = []
-        for bb in sorted_bb_info_list:
-            bb_xyxy.append(bb.xyxy)
-        
-        iou = compute_jaccard(torch.tensor([best.xyxy]), torch.tensor(bb_xyxy))[0]  # shape: (len(sorted_bb_info_list), )
-        
-        n = len(sorted_bb_info_list)
-        sorted_bb_info_list = [sorted_bb_info_list[i] for i in range(n) if iou[i] <= nms_threshold]
-    return output
+def offset_inverse(anchors, offset_preds):
+    """根据带有预测偏移量的锚框来预测边界框"""
+    # 和offset_boxes 相反的操作
+    anc = box_corner_to_center(anchors)
+    pred_bbox_xy = (offset_preds[:, :2] * anc[:, 2:] / 10) + anc[:, :2]
+    pred_bbox_wh = torch.exp(offset_preds[:, 2:] / 5) * anc[:, 2:]
+    pred_bbox = torch.cat((pred_bbox_xy, pred_bbox_wh), axis=1)
+    predicted_bbox = box_center_to_corner(pred_bbox)
+    return predicted_bbox
 
-def MultiBoxDetection(cls_prob, loc_pred, anchor, nms_threshold=0.5):
-    """
-    # 按照「9.4.1. 生成多个锚框」所讲的实现, anchor表示成归一化(xmin, ymin, xmax, ymax).
-    https://zh.d2l.ai/chapter_computer-vision/anchor.html
-    Args:
-        cls_prob: 经过softmax后得到的各个锚框的预测概率, shape:(bn, 预测总类别数+1, 锚框个数)
-        loc_pred: 预测的各个锚框的偏移量, shape:(bn, 锚框个数*4)
-        anchor: MultiBoxPrior输出的默认锚框, shape: (1, 锚框个数, 4)
-        nms_threshold: 非极大抑制中的阈值
-    Returns:
-        所有锚框的信息, shape: (bn, 锚框个数, 6)
-        每个锚框信息由[class_id, confidence, xmin, ymin, xmax, ymax]表示
-        class_id=-1 表示背景或在非极大值抑制中被移除了
-    """
-    assert len(cls_prob.shape) == 3 and len(loc_pred.shape) == 2 and len(anchor.shape) == 3
-    bn = cls_prob.shape[0]
-    
-    def MultiBoxDetection_one(c_p, l_p, anc, nms_threshold=0.5):
-        """
-        MultiBoxDetection的辅助函数, 处理batch中的一个
-        Args:
-            c_p: (预测总类别数+1, 锚框个数)
-            l_p: (锚框个数*4, )
-            anc: (锚框个数, 4)
-            nms_threshold: 非极大抑制中的阈值
-        Return:
-            output: (锚框个数, 6)
-        """
-        pred_bb_num = c_p.shape[1]
-        anc = (anc + l_p.view(pred_bb_num, 4)).detach().cpu().numpy()  # 加上偏移量
+def nms(boxes, scores, iou_threshold):
+    """对预测边界框的置信度进行排序"""
+    B = torch.argsort(scores, dim=-1, descending=True)
+    keep = []  # 保留预测边界框的指标
+    while B.numel() > 0:
+        i = B[0]
+        keep.append(i)
+        if B.numel() == 1: break
+        iou = box_iou(boxes[i, :].reshape(-1, 4), boxes[B[1:], :].reshape(-1, 4)).reshape(-1)
+        inds = torch.nonzero(iou <= iou_threshold).reshape(-1)
+        B = B[inds + 1]
+    return torch.tensor(keep, device=boxes.device)
+
+def multibox_detection(cls_probs, offset_preds, anchors, nms_threshold=0.5, pos_threshold=0.009999999):
+    """使用非极大值抑制来预测边界框"""
+    device, batch_size = cls_probs.device, cls_probs.shape[0]
+    anchors = anchors.squeeze(0)
+    num_classes, num_anchors = cls_probs.shape[1], cls_probs.shape[2]
+    out = []
+    for i in range(batch_size):
+        cls_prob, offset_pred = cls_probs[i], offset_preds[i].reshape(-1, 4)
+        conf, class_id = torch.max(cls_prob[1:], 0)
+        predicted_bb = offset_inverse(anchors, offset_pred)
+        keep = nms(predicted_bb, conf, nms_threshold)
         
-        confidence, class_id = torch.max(c_p, 0)
-        confidence = confidence.detach().cpu().numpy()
-        class_id = class_id.detach().cpu().numpy()
-        
-        pred_bb_info = [Pred_BB_Info(
-                            index = i,
-                            class_id = class_id[i] - 1,
-                            confidence = confidence[i],
-                            xyxy = [*anc[i]])  # xyxy是个列表
-                        for i in range(pred_bb_num)]
-        
-        # 正类的 index
-        obj_bb_idx = [bb.index for bb in non_max_suppression(pred_bb_info, nms_threshold)]
-        
-        output = []
-        for bb in pred_bb_info:
-            output.append([
-                (bb.class_id if bb.index in obj_bb_idx else -1.0),
-                bb.confidence,
-                *bb.xyxy
-            ])
-        
-        return torch.tensor(output)  # shape: (锚框个数, 6)
-    
-    batch_output = []
-    for b in range(bn):
-        batch_output.append(MultiBoxDetection_one(cls_prob[b], loc_pred[b], anchor[0], nms_threshold))
-    
-    return batch_output
+        # 找到所有的non_keep索引，并将类设置为背景
+        all_idx = torch.arange(num_anchors, dtype=torch.long, device=device)
+        combined = torch.cat((keep, all_idx))
+        uniques, counts = combined.unique(return_counts=True)
+        non_keep = uniques[counts == 1]
+        all_id_sorted = torch.cat((keep, non_keep))
+        class_id[non_keep] = -1
+        class_id = class_id[all_id_sorted]
+        conf, predicted_bb = conf[all_id_sorted], predicted_bb[all_id_sorted]
+        # pos_threshold 是一个用于非背景预测的阈值
+        below_min_idx = (conf < pos_threshold)
+        class_id[below_min_idx] = -1
+        conf[below_min_idx] = 1 - conf[below_min_idx]
+        pred_info = torch.cat((class_id.unsqueeze(1),
+                               conf.unsqueeze(1),
+                               predicted_bb), dim=1)
+        out.append(pred_info)
+    return torch.stack(out)
+
 
 ############################################ 9.6 ###########################################
+
+DATA_HUB = dict()
+DATA_URL = 'http://d2l-data.s3-accelerate.amazonaws.com/'
+
+def download(name, cache_dir=os.path.join('..', 'Datasets')):
+    """下载一个DATA_HUB中的文件，返回本地文件名"""
+    assert name in DATA_HUB, f"{name} 不存在于 {DATA_HUB}"
+    url, sha1_hash = DATA_HUB[name]
+    os.makedirs(cache_dir, exist_ok=True)
+    fname = os.path.join(cache_dir, url.split('/')[-1])
+    if os.path.exists(fname):
+        sha1 = hashlib.sha1()
+        with open(fname, 'rb') as f:
+            while True:
+                data = f.read(1048576)
+                if not data:
+                    break
+                sha1.update(data)
+        if sha1.hexdigest() == sha1_hash:
+            return fname  # 命中缓存
+    print(f'正在从{url}下载{fname}...')
+    r = requests.get(url, stream=True, verify=True)
+    with open(fname, 'wb') as f:
+        f.write(r.content)
+    return fname
+
+def download_extract(name, folder=None):  #@save
+    """下载并解压zip/tar文件"""
+    fname = download(name)
+    base_dir = os.path.dirname(fname)
+    data_dir, ext = os.path.splitext(fname)
+    if ext == '.zip':
+        fp = zipfile.ZipFile(fname, 'r')
+    elif ext in ('.tar', '.gz'):
+        fp = tarfile.open(fname, 'r')
+    else:
+        assert False, '只有zip/tar文件可以被解压缩'
+    fp.extractall(base_dir)
+    return os.path.join(base_dir, folder) if folder else data_dir
+
+def download_all():  #@save
+    """下载DATA_HUB中的所有文件"""
+    for name in DATA_HUB:
+        download(name)
+
+DATA_HUB['banana-detection'] = (DATA_URL + 'banana-detection.zip', '5de26c8fce5ccdea9f91267273464dc968d20d72')        
+
+def read_data_bananas(is_train=True):
+    """读取香蕉检测数据集中的图像和标签"""
+    data_dir = download_extract('banana-detection')
+    csv_fname = os.path.join(data_dir, 'bananas_train' if is_train else 'bananas_val', 'label.csv')
+    csv_data = pd.read_csv(csv_fname)
+    csv_data = csv_data.set_index('img_name')
+    images, targets = [], []
+    for img_name, target in csv_data.iterrows():
+        images.append(torchvision.io.read_image(os.path.join(data_dir, 'bananas_train' if is_train else
+                         'bananas_val', 'images', f'{img_name}')))
+        # 这里的target包含（类别，左上角x，左上角y，右下角x，右下角y），
+        # 其中所有图像都具有相同的香蕉类（索引为0）
+        targets.append(list(target))
+    return images, torch.tensor(targets).unsqueeze(1) / 256
+
+
+class BananaDataset(torch.utils.data.Dataset):
+    """一个用于加载香蕉检测数据集的自定义数据集"""
+    def __init__(self, is_train):
+        self.features, self.labels = read_data_bananas(is_train)
+        print('read ' + str(len(self.features)) + (f' training examples' if is_train else f' validation examples'))
+    
+    def __getitem__(self, idx):
+        return (self.features[idx].float(), self.labels[idx])
+    
+    def __len__(self):
+        return len(self.features)
+    
+    
+def load_data_bananas(batch_size):
+    """加载香蕉检测数据集"""
+    train_iter = torch.utils.data.DataLoader(BananaDataset(is_train=True), batch_size, shuffle=True)
+    val_iter = torch.utils.data.DataLoader(BananaDataset(is_train=False), batch_size)
+    return train_iter, val_iter
+    
+
 class PikachuDetDataset(torch.utils.data.Dataset):
     """皮卡丘检测数据集类"""
     def __init__(self, data_dir, part, image_size=(256, 256)):
@@ -616,7 +726,7 @@ class PikachuDetDataset(torch.utils.data.Dataset):
 
         return sample
     
-def load_data_pikachu(batch_size, edge_size=256, data_dir = '../data/pikachu'):  
+def load_data_pikachu(batch_size, edge_size=256, data_dir = '../Datasets/pikachu'):  
     """edge_size：输出图像的宽和高"""
     image_size = (edge_size, edge_size)
     train_dataset = PikachuDetDataset(data_dir, 'train', image_size)
